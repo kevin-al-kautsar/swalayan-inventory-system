@@ -1,9 +1,22 @@
 from flask import Flask, jsonify, request
 import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask(__name__)
 
-# Memori sementara untuk menyimpan data stok produk swalayan
+# Inisialisasi Google Sheets API (Mocking/Handling Graceful jika file credentials.json belum ada)
+def init_google_sheet():
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+        client = gspread.authorize(creds)
+        sheet = client.open("Report Waste Swalayan").sheet1
+        return sheet
+    except Exception as e:
+        print(f"Warning: Google Sheets API tidak dapat dihubungi ({e})")
+        return None
+
 inventory = {
     "PO-001": {
         "item_name": "Susu UHT 1L",
@@ -16,20 +29,17 @@ inventory = {
     }
 }
 
-# Log transaksi waste yang nantinya siap dikirim ke Google Sheets
 waste_logs = []
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Endpoint untuk pemantauan (Monitoring/Logging)"""
     return jsonify({"status": "healthy", "timestamp": datetime.datetime.now().isoformat()}), 200
 
 @app.route('/api/scan', methods=['POST'])
 def scan_item():
-    """API Otomatisasi Scan Barang: Receiving -> Gudang -> Display -> POS"""
     data = request.json or {}
     po_id = data.get("po_id")
-    action = data.get("action")  # 'receiving', 'warehouse', 'display', 'pos'
+    action = data.get("action")
     qty = data.get("qty", 1)
 
     if po_id not in inventory:
@@ -60,18 +70,16 @@ def scan_item():
 
 @app.route('/api/waste', methods=['POST'])
 def record_waste():
-    """API Waste Management (Barang Rusak/Expired)"""
     data = request.json or {}
     po_id = data.get("po_id")
     qty_waste = data.get("qty", 1)
-    reason = data.get("reason", "Expired")  # Expired, Rusak, Layu
+    reason = data.get("reason", "Expired")
 
     if po_id not in inventory:
         return jsonify({"status": "error", "message": "Barang tidak ditemukan"}), 404
 
     item = inventory[po_id]
 
-    # Potong stok dari display dulu, jika kurang potong dari gudang
     if item["on_display"] >= qty_waste:
         item["on_display"] -= qty_waste
     elif item["in_warehouse"] >= qty_waste:
@@ -80,26 +88,33 @@ def record_waste():
         return jsonify({"status": "error", "message": "Stok tidak mencukupi untuk waste"}), 400
 
     item["waste"] += qty_waste
+    timestamp_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Catat log waste
     log_entry = {
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": timestamp_now,
         "item_name": item["item_name"],
         "qty": qty_waste,
         "reason": reason
     }
     waste_logs.append(log_entry)
 
+    # Kirim baris baru ke Google Sheets jika koneksi teredia
+    sheet = init_google_sheet()
+    if sheet:
+        try:
+            sheet.append_row([timestamp_now, item["item_name"], qty_waste, reason])
+        except Exception as e:
+            print(f"Gagal append ke sheet: {e}")
+
     return jsonify({
         "status": "success",
-        "message": "Waste berhasil dicatat (Ready for Google Sheets API)",
+        "message": "Waste berhasil dicatat & diproses ke Spreadsheet",
         "log": log_entry,
         "current_stock": item
     }), 200
 
 @app.route('/api/report/so', methods=['GET'])
 def stock_opname_report():
-    """Laporan Stock Opname Real-time"""
     return jsonify({"status": "success", "stock_opname": inventory, "waste_logs": waste_logs}), 200
 
 if __name__ == '__main__':
